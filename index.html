@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="ko">
+<html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
@@ -8,25 +8,20 @@
   :root{ --perspective:900px; --strengthZ:120; --strengthXY:30; --tiltStrength:6; --bg:#0d0d0f; }
   html,body{height:100%;margin:0;background:var(--bg);color:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
   .stage{position:relative;height:100dvh;overflow:hidden;perspective:var(--perspective);
-         background:radial-gradient(ellipse at 50% 20%,#17171c 0%,#0d0d0f 60%);}
+         background:radial-gradient(ellipse at 50% 20%,#17171c 0%,#0d0d0f 60%);} 
   .board{position:absolute;inset:0;margin:auto;transform-style:preserve-3d;will-change:transform}
-  .layer{position:absolute;left:50%;top:50%;transform-style:preserve-3d;will-change:transform}
+  .layer{position:absolute;left:50%;top:50%;transform-style:preserve-3d;will-change:transform;transition:transform .35s ease}
   .sticker{
     position:absolute;
     transform:translate(-50%,-50%);
     will-change:transform;
-    /* filter:drop-shadow(0 8px 12px rgba(0,0,0,.35));  ← 제거 */
+    filter: drop-shadow(0 6px 10px rgba(0,0,0,.28));
+    transition: transform .35s ease;
   }
   .ui{position:fixed;left:12px;right:12px;bottom:12px;display:flex;gap:8px;align-items:center;justify-content:space-between;
       font-size:12px;color:#bbb;z-index:9999}
   .btn{padding:8px 12px;background:#1b1b22;border:1px solid #2a2a34;border-radius:10px;color:#ddd;cursor:pointer}
   .hint{opacity:.75}
-  .panel{position:fixed;right:12px;top:12px;width:min(420px,90vw);max-height:50vh;background:#101018;border:1px solid #262634;
-         border-radius:12px;padding:10px;display:none;z-index:9999}
-  .panel textarea{width:100%;height:36vh;background:#0c0c12;color:#a7ffb0;font:12px/1.35 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
-                  border:1px solid #2a2a34;border-radius:8px;padding:8px}
-  .edit .sticker{outline:1px dashed rgba(255,255,255,.35);cursor:grab;}
-  .edit .sticker:active{cursor:grabbing}
   @media (prefers-reduced-motion: reduce){ :root{ --strengthZ:40; --strengthXY:8; --tiltStrength:2 } }
 </style>
 </head>
@@ -34,24 +29,14 @@
   <div class="stage" id="stage"><div class="board" id="board"></div></div>
 
   <div class="ui">
-    <button class="btn" id="ios">iOS 센서 권한</button>
-    <label><input type="checkbox" id="editChk"> Edit Mode</label>
-    <div class="hint">기기를 기울여보세요 (데스크톱은 마우스)</div>
-  </div>
-
-  <div class="panel" id="panel">
-    <div style="color:#ddd;margin-bottom:6px"><strong>레이어 JSON</strong> (드래그하면 갱신)</div>
-    <textarea id="jsonBox" readonly></textarea>
-    <div style="display:flex;justify-content:space-between;margin-top:6px">
-      <button class="btn" id="copyJson">복사</button><span class="hint">Close = Edit Mode 해제</span>
-    </div>
+    <button class="btn" id="ios">Enable Motion Sensor (iOS)</button>
+    <div class="hint">Tilt your device (or move your mouse)</div>
   </div>
 
 <script>
-/* ---------- 1) 전역 크기 조정 변수 ---------- */
-const GLOBAL_SCALE = 0.35; // 전체 크기를 35%로 축소
+const GLOBAL_SCALE = 0.9;
 
-/* ---------- 2) 레이어 데이터 ---------- */
+/* ---------- 2) Layer data ---------- */
 const LAYERS = [
   { file:"assets/background.png", depth:-3, x:50, y:50, scale:1.00, alt:"wall" },
   { file:"assets/1.png",  depth:-2, x:28, y:40, scale:0.90, alt:"bulb L" },
@@ -70,7 +55,7 @@ const LAYERS = [
   { file:"assets/14.png", depth:3,  x:88, y:79, scale:0.85, alt:"tiny white" }
 ];
 
-/* ---------- 3) 설정 & 상태 ---------- */
+/* ---------- 3) Settings & state ---------- */
 const css = getComputedStyle(document.documentElement);
 const STRENGTH_Z  = parseFloat(css.getPropertyValue('--strengthZ')) || 120;
 const STRENGTH_XY = parseFloat(css.getPropertyValue('--strengthXY')) || 30;
@@ -82,14 +67,19 @@ const state  = { pitch:0, roll:0, yaw:0 };
 const clamp = (v,min,max) => Math.min(max, Math.max(min, v));
 const lerp  = (a,b,t) => a + (b - a) * t;
 
-/* ---------- 4) DOM 생성 ---------- */
+/* ---------- 3.5) Intensity knobs ---------- */
+const MOTION_GAIN = 1.3;                // 살짝 낮춤
+const SCALE_POP_NEAR = [0.94, 1.07];    // 팝 강도 약간 낮춤
+const SCALE_POP_BG   = [0.95, 1.03];    // 배경 그대로 유지
+
+/* ---------- 4) DOM creation ---------- */
 const nodes = [];
 for (const layer of LAYERS){
   const layerEl = document.createElement('div');
   layerEl.className = 'layer';
   layerEl.dataset.depth = String(layer.depth);
   const img = new Image();
-  img.decoding = 'async';                // ← 추가: 이미지 비동기 디코딩
+  img.decoding = 'async';
   img.src = layer.file;
   img.alt = layer.alt || '';
   img.className = 'sticker';
@@ -101,28 +91,62 @@ for (const layer of LAYERS){
   nodes.push({ layer, layerEl, img });
 }
 
-/* ---------- 5) 렌더 루프 ---------- */
+/* ---------- 5) Utility ---------- */
+function smoothstep(edge0, edge1, x){
+  const t = Math.min(1, Math.max(0, (x - edge0) / (edge1 - edge0)));
+  return t * t * (3 - 2 * t);
+}
+
+/* ---------- 6) Render loop ---------- */
 function tick(){
-  // 보간값 상향: 체감 FPS 부드럽게
   state.pitch = lerp(state.pitch, target.pitch, 0.12);
   state.roll  = lerp(state.roll , target.roll , 0.12);
   state.yaw   = lerp(state.yaw  , target.yaw  , 0.08);
 
+  const tiltMag = Math.min(1, Math.sqrt(state.pitch*state.pitch + state.roll*state.roll));
+
   board.style.transform = `rotateX(${state.pitch*TILT_STRENGTH}deg) rotateY(${-state.roll*TILT_STRENGTH}deg)`;
+
+  const depths = nodes.map(n => parseFloat(n.layerEl.dataset.depth) || 0);
+  const minD = Math.min(...depths), maxD = Math.max(...depths);
 
   for (const n of nodes){
     const d = parseFloat(n.layerEl.dataset.depth) || 0;
-    const z = (d/3) * STRENGTH_Z * (0.6 + state.pitch);
-    const x = (d/3) * state.roll  * STRENGTH_XY;
-    const y = (d/3) * state.pitch * STRENGTH_XY;
+    const isBG = (d <= -3) || /background/i.test(n.layer.file);
+    const gain = isBG ? 1 : MOTION_GAIN;
+
+    const z = (d/3) * STRENGTH_Z * (0.6 + state.pitch) * gain;
+    const x = (d/3) * state.roll  * STRENGTH_XY * gain;
+    const y = (d/3) * state.pitch * STRENGTH_XY * gain;
     n.layerEl.style.transform = `translate3d(${x}px, ${y}px, ${z}px)`;
     n.layerEl.style.zIndex = String(Math.round((d*10) + z));
+
+    const baseReveal = (d - minD) / Math.max(1, (maxD - minD));
+    const needBase = n.layer.reveal ?? (0.15 + baseReveal * 0.55);
+    let needStart = needBase - 0.08;
+    let needEnd   = needBase + 0.08;
+
+    const roll = state.roll;
+    const dirI = Math.min(1, Math.abs(roll));
+    const px   = (n.layer.x ?? 50) / 100;
+    const sideFavor = (roll < 0) ? px : (1 - px);
+    const BIAS_GAIN = 0.25;
+    const bias = sideFavor * dirI * BIAS_GAIN;
+    needStart -= bias;
+    needEnd   -= bias;
+
+    const done = smoothstep(needStart, needEnd, tiltMag);
+    const [s0, s1] = isBG ? SCALE_POP_BG : SCALE_POP_NEAR;
+    const appearScale = s0 + (s1 - s0) * done;
+
+    n.img.style.transform =
+      `translate(-50%,-50%) scale(${(n.layer.scale * GLOBAL_SCALE * appearScale).toFixed(3)})`;
   }
   requestAnimationFrame(tick);
 }
 requestAnimationFrame(tick);
 
-/* ---------- 6) 센서 + 폴백 ---------- */
+/* ---------- 7) Sensor setup ---------- */
 function setupOrientation(){
   if ('DeviceOrientationEvent' in window){
     window.addEventListener('deviceorientation', (e) => {
@@ -151,52 +175,6 @@ stage.addEventListener('pointermove', (e) => {
   const ny = (e.clientY - r.top ) / r.height * 2 - 1;
   target.roll  = clamp(nx, -1, 1);
   target.pitch = clamp(-ny, -1, 1);
-});
-
-/* ---------- 7) 간단 편집 모드 ---------- */
-const editChk = document.getElementById('editChk');
-const panel = document.getElementById('panel');
-const jsonBox = document.getElementById('jsonBox');
-const copyBtn = document.getElementById('copyJson');
-let editMode = false, dragging = null, rectCache = null;
-
-function refreshJSON(){
-  const data = nodes.map(n => ({ file:n.layer.file, depth:n.layer.depth, x:n.layer.x, y:n.layer.y, scale:n.layer.scale }));
-  jsonBox.value = JSON.stringify(data, null, 2);
-}
-refreshJSON();
-
-editChk.addEventListener('change', (e) => {
-  editMode = e.target.checked;
-  document.body.classList.toggle('edit', editMode);
-  panel.style.display = editMode ? 'block' : 'none';
-  for (const n of nodes){ n.img.style.pointerEvents = editMode ? 'auto' : 'none'; }
-});
-
-for (const n of nodes){
-  n.img.style.pointerEvents = 'none';
-  n.img.addEventListener('pointerdown', (ev) => {
-    if (!editMode) return;
-    dragging = n; n.img.setPointerCapture(ev.pointerId);
-    rectCache = stage.getBoundingClientRect();
-  });
-  n.img.addEventListener('pointermove', (ev) => {
-    if (!editMode || dragging !== n) return;
-    const nx = ((ev.clientX - rectCache.left) / rectCache.width ) * 100;
-    const ny = ((ev.clientY - rectCache.top ) / rectCache.height) * 100;
-    n.layer.x = clamp(nx, 0, 100);
-    n.layer.y = clamp(ny, 0, 100);
-    n.img.style.left = n.layer.x + '%';
-    n.img.style.top  = n.layer.y + '%';
-    refreshJSON();
-  });
-  n.img.addEventListener('pointerup', () => { dragging = null; });
-}
-
-copyBtn.addEventListener('click', () => {
-  jsonBox.select(); document.execCommand('copy');
-  copyBtn.textContent = '복사됨!';
-  setTimeout(() => { copyBtn.textContent = '복사'; }, 1200);
 });
 </script>
 </body>
